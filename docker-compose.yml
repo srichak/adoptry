@@ -1,0 +1,229 @@
+version: '2'
+
+networks:
+ &network adop-network:
+    driver: bridge
+
+volumes:
+  pgsql_data:
+  nginx_config:
+  nginx_releasenote:
+  jenkins_home:
+  jenkins_slave_home:
+  csvn_home:
+  ldap_db:
+  ldap_static:
+  gitlab_etc:
+  gitlab_log:
+  gitlab_opt:
+
+services:
+
+  ldap:
+    container_name: ldap
+    image: dockerhub.accenture.com/adop-afpo/adop-ldap
+    restart: always
+    environment:
+      INITIAL_ADMIN_USER: ${INITIAL_ADMIN_USER}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD}
+      JENKINS_PASSWORD: ${JENKINS_PWD}
+      SLAPD_PASSWORD: ${LDAP_PWD}
+      SLAPD_DOMAIN: ${LDAP_DOMAIN}
+      SLAPD_FULL_DOMAIN: ${LDAP_FULL_DOMAIN}
+    expose:
+      - "389"
+    volumes:
+      - ldap_db:/var/lib/ldap
+      - ldap_static:/etc/ldap
+    networks:
+      - *network
+
+  ldap-phpadmin:
+    container_name: ldap-phpadmin
+    restart: always
+    image: accenture/adop-ldap-phpadmin:0.1.0
+    expose:
+      - "80"
+    environment:
+      LDAP_SERVER_NAME: "LDAP"
+      LDAP_SERVER_HOST: "ldap"
+      LDAP_SERVER_PORT: "389"
+      LDAP_SERVER_BIND_ID: "cn=admin,${LDAP_FULL_DOMAIN}"
+      LDAP_SERVER_BASE_DN: "${LDAP_FULL_DOMAIN}"
+    networks:
+      - *network
+
+  ldap-ltb:
+    container_name: ldap-ltb
+    restart: always
+    image: accenture/adop-ldap-ltb:0.1.0
+    expose:
+      - "80"
+    environment:
+      LDAP_LTB_URL: "ldap://ldap:389"
+      LDAP_LTB_DN: "cn=admin,${LDAP_FULL_DOMAIN}"
+      LDAP_LTB_PWD: "${LDAP_PWD}"
+      LDAP_LTB_BS: "${LDAP_FULL_DOMAIN}"
+    networks:
+      - *network
+
+  proxy:
+    container_name: proxy
+    image: jembim/adop-accelerator-nginx:0.1
+    restart: always
+    environment:
+      LDAP_SERVER: "ldap:389"
+      LDAP_USERNAME: "cn=admin,${LDAP_FULL_DOMAIN}"
+      LDAP_PASSWORD: "${LDAP_PWD}"
+      LDAP_USER_BASE_DN: "ou=people,${LDAP_FULL_DOMAIN}"
+      LDAP_GROUP_ATTRIBUTE: "member"
+      LDAP_USER_ID_ATTRIBUTE: "cn"
+      LDAP_USER_OBJECT_CLASS: "inetOrgPerson"
+      GIT_REPO: "gitlab"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - nginx_config:/etc/nginx
+      - nginx_releasenote:/usr/share/nginx/html
+    networks:
+      - *network
+
+  gitlab:
+    container_name: gitlab
+    restart: always
+    image: gitlab/gitlab-ce:8.11.6-ce.0
+    expose:
+      - "80"
+      - "443"
+      - "22"
+    volumes:
+      - gitlab_etc:/etc/gitlab
+      - gitlab_opt:/var/opt/gitlab
+      - gitlab_log:/var/log/gitlab
+    environment:
+      GITLAB_ROOT_PASSWORD: ${PASSWORD_GITLAB}
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://${PUBLIC_IP}/gitlab'
+        gitlab_rails['smtp_enable'] = '${ADOP_SMTP_ENABLED}'
+        gitlab_rails['smtp_address'] = 'mail-server'
+        gitlab_rails['smtp_port'] = 25
+        gitlab_rails['smtp_user_name'] = '${INITIAL_ADMIN_USER}@${LDAP_DOMAIN}'
+        gitlab_rails['smtp_password'] = '${INITIAL_ADMIN_PASSWORD_PLAIN}'
+        gitlab_rails['smtp_domain'] = '${SMTP_DOMAIN}'
+        gitlab_rails['smtp_authentication'] = 'login'
+        gitlab_rails['smtp_enable_starttls_auto'] = true
+        gitlab_rails['smtp_openssl_verify_mode'] = 'peer'
+        gitlab_rails['ldap_enabled'] = true
+        gitlab_rails['ldap_servers'] = YAML.load <<-'EOS'
+          main:
+            label: 'LDAP'
+            host: ldap
+            port: 389
+            uid: 'uid'
+            method: 'plain'
+            bind_dn: 'cn=admin,${LDAP_FULL_DOMAIN}'
+            password: '${LDAP_PWD}'
+            active_directory: false
+            allow_username_or_email_login: false
+            block_auto_created_users: false
+            base: '${LDAP_FULL_DOMAIN}'
+        EOS
+    networks:
+      - *network
+
+  erp-manager:
+    container_name: erp-manager
+    image: dockerhub.accenture.com/adop-afpo/oracle-erp-manager
+    depends_on:
+      - erp-manager-db
+    restart: always
+    expose:
+      - "8090"
+    networks:
+      - *network
+
+  erp-manager-db:
+    image: dockerhub.accenture.com/adop-afpo/oracle-erp-postgres
+    container_name: ricewmanager.local
+    restart: always
+    environment:
+      PGDATA: "/var/lib/pgsql/data/pgdata"
+      POSTRES_USER: "postgres"
+      POSTGRES_PASSWORD: "${PASSWORD_SQL}"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgsql_data:/var/lib/pgsql/data/pgdata
+    networks:
+      - *network
+
+  jenkins:
+    container_name: jenkins
+    image: dockerhub.accenture.com/adop-afpo/oracle-ebs-jenkins
+    privileged: true
+    restart: always
+    environment:
+      JENKINS_OPTS: "--prefix=/jenkins"
+      ROOT_URL: "http://${TARGET_HOST}/jenkins/"
+      ADOP_MAVEN_ENABLED: "true"
+      ADOP_ANT_ENABLED: "true"
+      ADOP_LDAP_ENABLED: "true"
+      ADOP_SONAR_ENABLED: "false"
+      ADOP_NODEJS_ENABLED: "false"
+      SECURITY_ENABLED: "true"
+      JENKINS_CLI_DISABLED: "false"
+      GIT_GLOBAL_CONFIG_NAME: "ADOP Jenkins"
+      GIT_GLOBAL_CONFIG_EMAIL: "jenkins@adop-core"
+      LDAP_SERVER: "ldap:389"
+      LDAP_ROOTDN: "${LDAP_FULL_DOMAIN}"
+      LDAP_USER_SEARCH_BASE: "ou=people"
+      LDAP_USER_SEARCH: "uid={0}"
+      LDAP_GROUP_SEARCH_BASE: "ou=groups"
+      LDAP_GROUP_SEARCH_FILTER: ""
+      LDAP_GROUP_MEMBERSHIP_FILTER: ""
+      LDAP_MANAGER_DN: "cn=admin,${LDAP_FULL_DOMAIN}"
+      LDAP_MANAGER_PASSWORD: ${LDAP_PWD}
+      LDAP_INHIBIT_INFER_ROOTDN: "false"
+      LDAP_DISABLE_MAIL_ADDRESS_RESOLVER: "false"
+      LDAP_DISPLAY_NAME_ATTRIBUTE_NAME: "displayName"
+      LDAP_MAIL_ADDRESS_ATTRIBUTE_NAME: "mail"
+      INITIAL_ADMIN_USER: ${INITIAL_ADMIN_USER}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD_PLAIN}
+    expose:
+      - "8080"
+      - "50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - *network
+
+  jenkins-slave:
+    container_name: jenkins-slave
+    image: bzon/ricew-jenkins-slave:latest
+    restart: always
+    privileged: true
+    depends_on:
+      - jenkins
+    environment:
+      SLAVE_NAME: "Postgres_Ricew"
+      SLAVE_LABELS: "java docker ldap svn postgres"
+      SLAVE_EXECUTORS: "5"
+    volumes:
+      - jenkins_slave_home:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - *network
+
+  svn-server:
+    container_name: svn-server
+    image: bzon/subversion-edge:latest
+    restart: always
+    expose:
+      - "80"
+      - "3343"
+    volumes:
+      - csvn_home:/var/csvn_home/csvn
+    networks:
+      - *network
